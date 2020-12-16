@@ -1,0 +1,796 @@
+---
+title: "Test"
+output: pdf_document
+---
+
+
+```{r, echo=FALSE, cache=FALSE, results='hyde', warning=FALSE, comment=FALSE, warning=FALSE, include=FALSE}
+
+library(aaltobda)
+library ('mvtnorm')
+library("rstan")
+library("loo")
+library("rstanarm")
+library("bayesplot")
+library(ggplot2)
+
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+Sys.setenv(LOCAL_CPPFLAGS = '-march=native')
+
+```
+
+```{r, echo=FALSE, cache=FALSE, results='hyde', warning=FALSE, comment=FALSE, warning=FALSE, include=FALSE}
+library(readr)
+dataset <- read.csv("suiciderate_rounded.csv", header=TRUE, row.names="Year")
+summary(dataset)
+
+yreal <- dataset[22,]
+
+```
+
+```{r, echo=FALSE, cache=FALSE, results='hyde', warning=FALSE, comment=FALSE, warning=FALSE, include=FALSE}
+
+# CREATION OF THE DATASET (x=groups, y=values), in order to apply the models
+x = c(rep(1,22), rep(2,22), rep(3,22), rep(4,22),rep(5,22))
+y=dataset[,1]
+for (i in 2:5) {
+  y=cbind(y,dataset[,i])
+}
+y=as.vector(y)
+
+```
+
+
+```{r, echo=FALSE, out.width='.49\\linewidth', fig.show='hold', fig.height = 6, fig.width = 8, fig.align="center"}
+par(mar=rep(6,4))
+boxplot(dataset[,1:5], las=2, col='red',ylim=c(0,30))
+```
+Moreover, in the following matplot every line corresponds to a different state. The y-axes represents the number of fires for that state while the x-axes represent the years (from 1998 to 2017).
+It can be seen that there is not a linear increasing of the number of fires among the years.
+
+```{r, echo=FALSE, fig.show='hold', fig.height = 4, fig.width = 6, fig.align="center"}
+matplot(dataset, las=2,type = "l", col="Red", xlab="Years: from 1994 to 2016", ylab="Number of sucicides per 100k")
+```
+
+
+```{r, echo=TRUE, tidy=FALSE}
+
+# STAN CODE: SEPARATE NORMAL MODEL
+separate_code = "
+
+data {
+  int<lower=0> N;             // number of data points
+  int<lower=0> K;             // number of groups
+  int<lower=1,upper=K> x[N];  // group indicator
+  vector[N] y;
+}
+
+parameters {
+  vector[K] mu;               // group means
+  vector<lower=0>[K] sigma;   // group stds
+}
+
+model {
+  y ~ normal(mu[x], sigma[x]);
+}
+
+generated quantities {
+  vector[K] y_state;
+  vector[N] log_lik;                                
+
+  for (i in 1:N)                                           
+    log_lik[i] = normal_lpdf(y[i] | mu[x[i]], sigma[x[i]]);     
+  
+  for (i in 1:K)
+    y_state[i]=normal_rng(mu[i], sigma[i]);
+}
+"
+```
+
+
+
+```{r, echo=FALSE, tidy=FALSE,cache=FALSE, results='hyde', warning=FALSE, comment=FALSE, warning=FALSE, include=FALSE}
+data_s = list(
+  N = 22*5,
+  K = 5,
+  x = x,
+  y = y
+)
+
+# FIT OF THE MODEL IN STAN
+fit_separate <- stan(
+  model_code = separate_code,  # Stan program
+  data = data_s,    # named list of data
+  chains = 4,     # number of Markov chains
+  iter =4000,    # total number of iterations per chain
+  warmup=3000,
+  cores = 2       # number of cores (could use one per chain)
+)
+
+samples_s = extract(object=fit_separate, permuted = TRUE, inc_warmup = FALSE, include = TRUE)
+
+```
+
+
+```{r}
+print(fit_separate)
+```
+
+```{r, echo=TRUE, tidy=FALSE}
+# STAN CODE: HIERARCHICAL NORMAL MODEL
+hierarchical_code = "
+
+data {
+  int<lower=0> N;           // number of data points
+  int<lower=0> K;           // number of groups
+  int<lower=1,upper=K> x[N]; // group indicator
+  vector[N] y;              
+}
+
+parameters {
+  real mu0;                 // prior mean
+  real<lower=0> sigma0;     // prior std
+  vector[K] mu;             // group means
+  real<lower=0> sigma;      // common std
+}
+
+model {
+
+  mu0 ~ normal(14.89,18.39);  // weakly informative prior
+  sigma0 ~ cauchy(0,4);      // weakly informative prior
+  mu ~ normal(mu0, sigma0);  // population prior with unknown parameters
+  sigma ~ cauchy(0,4);       // weakly informative prior
+  y ~ normal(mu[x], sigma);
+}
+
+generated quantities {
+  real ypred;
+  real mupred;
+  vector[K] y_state;
+  vector[N] log_lik; 
+
+  mupred = normal_rng(mu0,sigma0);
+  ypred = normal_rng(mupred, sigma);
+  
+  for (i in 1:N) 
+    log_lik[i] = normal_lpdf(y[i] | mu[x[i]], sigma); 
+
+  for (i in 1:K)
+    y_state[i]=normal_rng(mu[i], sigma);
+
+}
+"
+```
+
+
+
+
+```{r, echo=FALSE, tidy=FALSE,cache=FALSE, results='hyde', warning=FALSE, comment=FALSE, warning=FALSE, include=FALSE}
+data_hierarchical = list(
+  N = 22*5,
+  K = 5,
+  x = x,
+  y = y
+)
+
+# FIT OF THE MODEL IN STAN
+fit_hierarchical <- stan(
+  model_code = hierarchical_code,  # Stan program
+  data = data_hierarchical,    # named list of data
+  chains = 4,     # number of Markov chains
+  iter =4000,    # total number of iterations per chain
+  warmup=3000,
+  cores = 2       # number of cores (could use one per chain)
+)
+
+samples_h = extract(object=fit_hierarchical, permuted = TRUE, inc_warmup = FALSE, include = TRUE)
+
+```
+
+```{r}
+print(fit_hierarchical)
+```
+
+## 5.2 Negative Binomial Models
+As discussed in the methods section of this document, the data has a higher variance than mean. Because of this we applied a negative binomial model to the data.
+
+## 5.2.1 Separate Negative Binomial Model
+
+```{r, echo=TRUE, tidy=FALSE}
+# STAN CODE: SEPARATE NEGATIVE BINOMIAL MODEL
+separate_negative_bin = "
+
+data {
+  int<lower=0> N;             // number of data points
+  int<lower=0> K;             // number of groups
+  int<lower=1,upper=K> x[N];  // group indicator
+  int<lower=0> y[N];              
+}
+
+parameters {
+  real<lower=0> mu[K]; 
+  real<lower=0> phi[K];
+}
+
+model {
+  mu ~ normal(14.89,10); //weekly informative prior
+  phi ~ normal(63.35,10); // weekly informative prior
+  y ~ neg_binomial_2(mu[x], phi[x]); // likelihood
+}
+
+generated quantities {
+  real<lower=0> y_rep[K]; 
+  vector[N] log_lik; 
+  
+  for (i in 1:N) 
+    log_lik[i] = neg_binomial_2_lpmf(y[i] | mu[x[i]], phi[x[i]]);
+
+  for (i in 1:K) 
+    y_rep[i] = neg_binomial_2_rng(mu[i], phi[i]); 
+}
+"
+
+```
+
+```{r, echo=FALSE, tidy=FALSE,cache=FALSE, results='hyde', warning=FALSE, comment=FALSE, warning=FALSE, include=FALSE}
+# DEFINITION OF THE DATA (a subset of data)
+data = list(
+  N=22*5, #N = 4*20,    #
+  K=5, #K = 4,       #
+  x=x, #x = x[1:80], #
+  y=y #y = y[1:80]  #
+)
+
+# FIT OF THE MODEL IN STAN
+separate_neg_binomial_fit <- stan(
+  model_code = separate_negative_bin,  # Stan program
+  data = data,    # named list of data
+  chains = 4,     # number of Markov chains
+  iter =4000,    # total number of iterations per chain
+  warmup=3000,
+  cores = 2       # number of cores (could use one per chain)
+)
+
+samples_s_nb = extract(object=separate_neg_binomial_fit, permuted = TRUE, inc_warmup = FALSE, include = TRUE)
+print(separate_neg_binomial_fit)
+
+```
+
+```{r}
+print(separate_neg_binomial_fit)
+```
+
+## 5.2.2 Hierarchical Negative Binomial Model
+
+```{r, echo=TRUE, tidy=FALSE}
+ # STAN CODE: DEFINITION OF HIERARCHICAL NEGATIVE BINOMIAL MODEL
+hierarchical_negative_bin = "
+
+data {
+  int<lower=0> N;           // number of data points
+  int<lower=0> K;           // number of groups
+  int<lower=1,upper=K> x[N]; // group indicator
+  int<lower=0> y[N];              
+}
+
+parameters {
+  real mu;
+  real<lower=0> phi[K]; 
+}
+
+model {
+  mu ~ normal(14.89,10); //weekly informative prior
+  phi ~ normal(63.35,10); // weekly informative prior
+  y ~ neg_binomial_2(mu, phi[x]); // likelihood
+
+}
+
+generated quantities {
+  int<lower=0> y_rep[K]; 
+  vector[N] log_lik; 
+  
+  for (i in 1:N) 
+    log_lik[i] = neg_binomial_2_lpmf(y[i] | mu, phi[x[i]]);
+    
+  for (i in 1:K) 
+    y_rep[i] = neg_binomial_2_rng(mu, phi[i]); 
+}
+"
+```
+
+
+```{r, echo=FALSE, tidy=FALSE,tidy=FALSE,cache=FALSE, warning=FALSE, comment=FALSE, warning=FALSE, include=FALSE}
+# DEFINITION OF THE DATA
+data = list(
+  N=5*22, # N = 4*20
+  K = 5,  # K=4
+  x = x, #x=x[1:80]
+  y = y  #y=y[1:80]
+)
+
+
+# FIT OF THE MODEL IN STAN: choose the model to fit!
+hierarchical_neg_binomial_fit <- stan(
+  model_code = hierarchical_negative_bin,  # Stan program
+  data = data,    # named list of data
+  chains = 4,     # number of Markov chains
+  iter =4000,    # total number of iterations per chain
+  warmup=3000,
+  cores = 2       # number of cores (could use one per chain)
+)
+
+samples_h_nb = extract(object=hierarchical_neg_binomial_fit, permuted = TRUE, inc_warmup = FALSE, include = TRUE)
+print(hierarchical_neg_binomial_fit)
+
+```
+
+
+```{r}
+print(hierarchical_neg_binomial_fit)
+```
+
+
+#6 Results
+Here the PSIS-LOO elpd values and the k-values for each of the two normal models and the two negative binomial models introduced in the last section as well as the effective number of parameters Peff for each of the model.
+The values for PSIS_LOO and the peff are displayed under the plot of k-values.
+
+
+## SEPARATE NORMAL MODEL
+```{r, echo=FALSE, tidy=FALSE, warning=FALSE}
+loo_separate=loo(fit_separate)
+log_lik_s <- extract_log_lik(fit_separate, merge_chains = FALSE)
+r_eff_s <- relative_eff(exp(log_lik_s))
+loo_s <- loo(log_lik_s, r_eff = r_eff_s, save_psis=TRUE, cores=2 )
+print(loo_s)
+plot(loo_separate)
+
+PSIS_LOO=loo_s$estimates[1]
+PSIS_LOO
+
+S=4000
+n=22*5
+
+vector_s=rep(0,n)
+for(i in 1:n)
+ vector_s[i]=log(1/S*(sum(exp(samples_s$log_lik[,i]))))
+
+peff = sum(vector_s) - loo_s$estimates[1] 
+peff
+```
+
+
+## HIERARCHICAL NORMAL MODEL
+```{r, echo=FALSE, tidy=FALSE, warning=FALSE}
+loo_hierarchical=loo(fit_hierarchical)
+log_lik_h <- extract_log_lik(fit_hierarchical, merge_chains = FALSE)
+r_eff_h <- relative_eff(exp(log_lik_h))
+loo_h <- loo(log_lik_h, r_eff = r_eff_h, save_psis=TRUE, cores=2 )
+print(loo_h)
+plot(loo_hierarchical)
+
+PSIS_LOO=loo_h$estimates[1]
+PSIS_LOO
+
+S=4000
+n=22*5
+
+vector_h=rep(0,n)
+for(i in 1:n)
+ vector_h[i]=log(1/S*(sum(exp(samples_h$log_lik[,i]))))
+
+peff = sum(vector_h) - loo_h$estimates[1] 
+peff
+```
+
+
+
+## SEPARATE NEGATIVE BINOMIAL MODEL
+```{r, echo=FALSE, tidy=FALSE, warning=FALSE}
+# Separate Model
+log_lik_s_nb <- extract_log_lik(separate_neg_binomial_fit, merge_chains = FALSE)
+r_eff_s_nb <- relative_eff(exp(log_lik_s_nb))
+loo_model_s_nb <- loo(log_lik_s_nb, r_eff = r_eff_s_nb, save_psis=TRUE, cores=2 )
+print(loo_model_s_nb)
+plot(loo_model_s_nb)
+
+PSIS_LOO=loo_model_s_nb$estimates[1] #separate
+PSIS_LOO
+
+S=4000
+n=5*22
+
+vector_s_nb=rep(0,n)
+for(i in 1:n)
+ vector_s_nb[i]=log(1/S*(sum(exp(samples_s_nb$log_lik[,i]))))
+
+peff = sum(vector_s_nb) - loo_model_s_nb$estimates[1] 
+peff
+```
+
+## HIERARCHICAL NEGATIVE BINOMIAL MODEL
+```{r, echo=FALSE, tidy=FALSE, warning=FALSE}
+# Hierarchical Model
+log_lik_h_nb <- extract_log_lik(hierarchical_neg_binomial_fit, merge_chains = FALSE)
+r_eff_h_nb <- relative_eff(exp(log_lik_h_nb))
+loo_model_h_nb <- loo(log_lik_h_nb, r_eff = r_eff_h_nb, save_psis=TRUE, cores=2 )
+print(loo_model_h_nb)
+plot(loo_model_h_nb)
+
+PSIS_LOO=loo_model_s_nb$estimates[1] #separate
+PSIS_LOO
+
+S=4000
+n=5*22
+
+vector_h_nb=rep(0,n)
+for(i in 1:n)
+ vector_h_nb[i]=log(1/S*(sum(exp(samples_h_nb$log_lik[,i]))))
+
+peff = sum(vector_h_nb) - loo_model_h_nb$estimates[1] 
+peff
+```
+
+
+#7 Choosing the best model - SEPARATE MODEL
+The best model is chosen by how closely the fitted model resembles the actual data and the accuracy of its predictions for individual states, as well as the PSIS_LOO values visible in the previous section. Separate Negative Binomial model is the best one between the first four models. For this model, the fit is done on the years 1998-2016 and then the prediction for the year 2017 is compared to the data.
+
+```{r, echo=TRUE, tidy=FALSE,echo=FALSE, tidy=FALSE,cache=FALSE, results='hyde', warning=FALSE, comment=FALSE, warning=FALSE, include=FALSE}
+# STAN CODE: SEPARATE MODEL
+
+separate_prediction1 = "
+data {
+  int<lower=0> N;             // number of data points
+  int<lower=0> K;             // number of groups
+  int<lower=1,upper=K> x[N];  // group indicator
+  vector[N] y;
+}
+
+parameters {
+  vector[K] mu;               // group means
+  vector<lower=0>[K] sigma;   // group stds
+}
+
+model {
+  y ~ normal(mu[x], sigma[x]);
+}
+
+generated quantities {
+  vector[K] y_state;
+  vector[N] log_lik;                                
+
+  for (i in 1:N)                                           
+    log_lik[i] = normal_lpdf(y[i] | mu[x[i]], sigma[x[i]]);     
+  
+  for (i in 1:K)
+    y_state[i]=normal_rng(mu[1], sigma[1]);
+}
+"
+
+separate_prediction2 = "
+data {
+  int<lower=0> N;             // number of data points
+  int<lower=0> K;             // number of groups
+  int<lower=1,upper=K> x[N];  // group indicator
+  vector[N] y;
+}
+
+parameters {
+  vector[K] mu;               // group means
+  vector<lower=0>[K] sigma;   // group stds
+}
+
+model {
+  y ~ normal(mu[x], sigma[x]);
+}
+
+generated quantities {
+  vector[K] y_state;
+  vector[N] log_lik;                                
+
+  for (i in 1:N)                                           
+    log_lik[i] = normal_lpdf(y[i] | mu[x[i]], sigma[x[i]]);     
+  
+  for (i in 1:K)
+    y_state[i]=normal_rng(mu[2], sigma[2]);
+}
+"
+
+separate_prediction3 = "
+data {
+  int<lower=0> N;             // number of data points
+  int<lower=0> K;             // number of groups
+  int<lower=1,upper=K> x[N];  // group indicator
+  vector[N] y;
+}
+
+parameters {
+  vector[K] mu;               // group means
+  vector<lower=0>[K] sigma;   // group stds
+}
+
+model {
+  y ~ normal(mu[x], sigma[x]);
+}
+
+generated quantities {
+  vector[K] y_state;
+  vector[N] log_lik;                                
+
+  for (i in 1:N)                                           
+    log_lik[i] = normal_lpdf(y[i] | mu[x[i]], sigma[x[i]]);     
+  
+  for (i in 1:K)
+    y_state[i]=normal_rng(mu[3], sigma[3]);
+}
+"
+separate_prediction4 = "
+data {
+  int<lower=0> N;             // number of data points
+  int<lower=0> K;             // number of groups
+  int<lower=1,upper=K> x[N];  // group indicator
+  vector[N] y;
+}
+
+parameters {
+  vector[K] mu;               // group means
+  vector<lower=0>[K] sigma;   // group stds
+}
+
+model {
+  y ~ normal(mu[x], sigma[x]);
+}
+
+generated quantities {
+  vector[K] y_state;
+  vector[N] log_lik;                                
+
+  for (i in 1:N)                                           
+    log_lik[i] = normal_lpdf(y[i] | mu[x[i]], sigma[x[i]]);     
+  
+  for (i in 1:K)
+    y_state[i]=normal_rng(mu[4], sigma[4]);
+}
+"
+
+separate_prediction5 = "
+data {
+  int<lower=0> N;             // number of data points
+  int<lower=0> K;             // number of groups
+  int<lower=1,upper=K> x[N];  // group indicator
+  vector[N] y;
+}
+
+parameters {
+  vector[K] mu;               // group means
+  vector<lower=0>[K] sigma;   // group stds
+}
+
+model {
+  y ~ normal(mu[x], sigma[x]);
+}
+
+generated quantities {
+  vector[K] y_state;
+  vector[N] log_lik;                                
+
+  for (i in 1:N)                                           
+    log_lik[i] = normal_lpdf(y[i] | mu[x[i]], sigma[x[i]]);     
+  
+  for (i in 1:K)
+    y_state[i]=normal_rng(mu[5], sigma[5]);
+}
+"
+```
+
+```{r, echo=FALSE, tidy=FALSE,cache=FALSE, results='hyde', warning=FALSE, comment=FALSE, warning=FALSE, include=FALSE}
+
+# CREATION OF THE DATASET (x=groups, y=values), in order to apply the models
+
+x = c(rep(1,21), rep(2,21), rep(3,21), rep(4,21),rep(5,21))
+
+y=dataset[1:21,1]
+
+for (i in 2:5) {
+  y=cbind(y,dataset[1:21,i])
+}
+y=as.vector(y)
+
+
+# DEFINITION OF THE DATA (a subset of data)
+data = list(
+  N=5*21, #N = 4*20,    #
+  K=5, #K = 4,       #
+  x=x, #x = x[1:80], #
+  y=y #y = y[1:80]  #
+)
+
+# FIT OF THE MODEL IN STAN
+
+separate_fit1 <- stan(
+  model_code = separate_prediction1,  # Stan program
+  data = data,    # named list of data
+  chains = 4,     # number of Markov chains
+  iter =4000,    # total number of iterations per chain
+  warmup=3000,
+  cores = 2       # number of cores (could use one per chain)
+)
+samples_s_1 = extract(object=separate_fit1, permuted = TRUE, inc_warmup = FALSE, include = TRUE)
+
+
+separate_fit2 <- stan(
+  model_code = separate_prediction2,  # Stan program
+  data = data,    # named list of data
+  chains = 4,     # number of Markov chains
+  iter =4000,    # total number of iterations per chain
+  warmup=3000,
+  cores = 2       # number of cores (could use one per chain)
+)
+samples_s_2 = extract(object=separate_fit2, permuted = TRUE, inc_warmup = FALSE, include = TRUE)
+
+
+separate_fit3 <- stan(
+  model_code = separate_prediction3,  # Stan program
+  data = data,    # named list of data
+  chains = 4,     # number of Markov chains
+  iter =4000,    # total number of iterations per chain
+  warmup=3000,
+  cores = 2       # number of cores (could use one per chain)
+)
+samples_s_3 = extract(object=separate_fit3, permuted = TRUE, inc_warmup = FALSE, include = TRUE)
+
+separate_fit4 <- stan(
+  model_code = separate_prediction4,  # Stan program
+  data = data,    # named list of data
+  chains = 4,     # number of Markov chains
+  iter =4000,    # total number of iterations per chain
+  warmup=3000,
+  cores = 2       # number of cores (could use one per chain)
+)
+samples_s_4 = extract(object=separate_fit4, permuted = TRUE, inc_warmup = FALSE, include = TRUE)
+
+
+separate_fit5 <- stan(
+  model_code = separate_prediction5,  # Stan program
+  data = data,    # named list of data
+  chains = 4,     # number of Markov chains
+  iter =4000,    # total number of iterations per chain
+  warmup=3000,
+  cores = 2       # number of cores (could use one per chain)
+)
+samples_s_5 = extract(object=separate_fit5, permuted = TRUE, inc_warmup = FALSE, include = TRUE)
+```
+
+
+##8.1 Separate model
+
+### SPECIFIC CONVERGENCE DIAGNOSTIC (HMC)
+The following analysis of convergence diagnostic is reported just for the first country.The procedure and the results are similar for the other 4 countries.First, the diagnostic plots are displayed.
+
+##### Plot of sigma chains for Denmark
+```{r,echo=FALSE, fig.height = 6, fig.width = 8, fig.align="center"}
+mu=samples_s_1$mu
+sigma=samples_s_1$sigma
+
+#alpha
+matplot(sigma[1:1000,1],type="line", col="yellow", xlab="Iteration", ylab="Alpha")
+lines(sigma[1001:2000,1], col="red")
+lines(sigma[2001:3000,1], col="orange")
+lines(sigma[3001:4000,1], col="blue")
+```
+
+Sigma chains seem visually convergent.
+
+##### Plot of Mu chains for Denmark
+```{r,echo=FALSE, fig.height = 6, fig.width = 8, fig.align="center"}
+matplot(mu[1:1000,1],type="line", col="yellow", xlab="Iteration", ylab="Beta")
+lines(mu[1001:2000,1], col="red")
+lines(mu[2001:3000,1], col="orange")
+lines(mu[3001:4000,1], col="blue")
+
+SIGMA=cbind(sigma[1:1000,1],sigma[1001:2000,1],sigma[2001:3000,1], sigma[3001:4000,1])
+MU=cbind(mu[1:1000,1], mu[1001:2000,1], mu[2001:3000,1], mu[3001:4000,1])
+```
+
+mu chain seem visually convergent.
+
+##### Rhat value for SIGMA (Acre state)
+```{r,echo=FALSE, fig.height = 6, fig.width = 8, fig.align="center"}
+Rhat(SIGMA)
+```
+##### Rhat value for BETA (Acre state)
+```{r,echo=FALSE, fig.height = 6, fig.width = 8, fig.align="center"}
+Rhat(MU)
+```
+
+##### Comments on the values of Rhat
+For the calculation of Rhat, we have used the Rhat function of R.
+$$ \widehat{R} \xrightarrow{\text{N }\rightarrow \infty} 1 $$
+
+This value is an estimate of how much the scale of the elements of ALPHA and BETA matrices (obtained by juxtapose chains for alpha and beta respectively one next to each other) could reduce if N goes to infinity.
+It is also known from theory that if Rhat is big (this means greater than 1.01) it is better to keep sampling.
+In this case the output for the two matrices are lower than 1.01 and close to 1, so it means with high probability that the chains are converging.
+
+### EFFECTIVE SAMPLE SIZE DIAGNOSTIC (ESS)
+The amount by which autocorrelation within the chains increases uncertainty in estimates can be measured by effective sample size (ESS). Given independent samples, the central limit theorem bounds uncertainty in estimates based on the number of samples N. Given dependent samples, the number of independent samples is replaced with the effective sample size  
+Neff, which is the number of independent samples with the same estimation power as the N autocorrelated samples.
+
+
+### POSTERIOR PREDICTIVE CHECKING FOR THE FIRST THREE Countries
+```{r, echo=FALSE, out.width='.32\\linewidth', fig.show='hold', fig.height = 6, fig.width = 8, fig.align="center"}
+vector1=rep(0,4000)
+for (i in 1:4000) {
+  vector1[i]=mean(samples_s_1$y_state[i,])
+}
+hist(vector1, main ="Denmark")
+abline(v=c(mean(dataset[,1]),yreal[1]), col=c("red", "blue"), lwd=c(3, 3))
+legend("topright", c("Prior Mean", "Real data"), col=c("red", "blue"), lwd=3)
+
+
+vector2=rep(0,4000)
+for (i in 1:4000) {
+  vector2[i]=mean(samples_s_2$y_state[i,])
+}
+hist(vector2, main="Finland")
+abline(v=c(mean(dataset[,2]),yreal[2]), col=c("red", "blue"), lwd=c(3, 3))
+legend("topright", c("Prior Mean", "Real data"), col=c("red", "blue"), lwd=3)
+
+
+vector3=rep(0,4000)
+for (i in 1:4000) {
+  vector3[i]=mean(samples_s_3$y_state[i,])
+}
+hist(vector3, main="Iceland")
+abline(v=c(mean(dataset[,3]),yreal[3]), col=c("red", "blue"), lwd=c(3, 3))
+legend("topright", c("Prior Mean", "Real data"), col=c("red", "blue"), lwd=3)
+
+
+vector4=rep(0,4000)
+for (i in 1:4000) {
+  vector4[i]=mean(samples_s_4$y_state[i,])
+}
+hist(vector4, main="Norway")
+abline(v=c(mean(dataset[,4]),yreal[4]), col=c("red", "blue"), lwd=c(3, 3))
+legend("topright", c("Prior Mean", "Real data"), col=c("red", "blue"), lwd=3)
+
+
+vector5=rep(0,4000)
+for (i in 1:4000) {
+  vector5[i]=mean(samples_s_5$y_state[i,])
+}
+hist(vector5, main="Sweden")
+abline(v=c(mean(dataset[,5]),yreal[5]), col=c("red", "blue"), lwd=c(3, 3))
+legend("topright", c("Prior Mean", "Real data"), col=c("red", "blue"), lwd=3)
+
+
+```
+
+
+
+
+
+### ELPD values comparision betweens models
+```{r, echo=FALSE,out.width='.49\\linewidth', fig.height = 5, fig.width = 5, fig.align="center"}
+loo_compare(loo_s, loo_h, loo_model_s_nb, loo_model_h_nb )
+```
+The larger the better
+
+
+```{r}
+
+
+fit_separate_results <- monitor(fit_separate)
+fit_hierarchical_results <- monitor(fit_hierarchical)
+separate_neg_binomial_fit_results <- monitor(separate_neg_binomial_fit)
+hierarchical_neg_binomial_fit_results <- monitor(hierarchical_neg_binomial_fit)
+
+
+convergence_results <- data.frame(models=c("Normal Separate Model", "Normal hierarchical model", "Separate Negative Binomial Model", "Hierarchical Separate Negative Binomial Model"),
+max_Rhat=c(max(fit_separate_results$Rhat),max(fit_hierarchical_results$Rhat),
+max(separate_neg_binomial_fit_results$Rhat),max(hierarchical_neg_binomial_fit_results$Rhat)),
+
+min_ESS=c(min(fit_separate_results$Bulk_ESS),min(fit_hierarchical_results$Bulk_ESS),
+min(separate_neg_binomial_fit_results$Bulk_ESS),min(hierarchical_neg_binomial_fit_results$Bulk_ESS)))
+
+table(convergence_results, caption = "max Rhat and min ESS values of models")
+```
